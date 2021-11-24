@@ -16,13 +16,15 @@ The result is returned as a `String` _(ex. m5.large)_.
 
 #![deny(rust_2018_idioms)]
 
+use std::sync::RwLock;
+
 use http::StatusCode;
 use log::{debug, info, trace, warn};
 use reqwest::Client;
 use serde_json::Value;
 use snafu::{ensure, OptionExt, ResultExt};
-use std::time::Duration;
-use tokio::time;
+use tokio::time::{timeout, Duration};
+use tokio_retry::{strategy::FibonacciBackoff, Retry};
 
 const BASE_URI: &str = "http://169.254.169.254";
 const PINNED_SCHEMA: &str = "2021-01-03";
@@ -30,12 +32,18 @@ const PINNED_SCHEMA: &str = "2021-01-03";
 // Currently only able to get fetch session tokens from `latest`
 const SESSION_TARGET: &str = "latest/api/token";
 
+fn retry_strategy() -> impl Iterator<Item = Duration> {
+    // Retries (relative to start) at 0.5s, 1s, 2s, 3.5s, 6s, 10s, 16.5s, and then every 10s after.
+    FibonacciBackoff::from_millis(500).max_delay(Duration::from_secs(10))
+}
+
 /// A client for making IMDSv2 queries.
 /// It obtains a session token when it is first instantiated and is reused between helper functions.
 pub struct ImdsClient {
     client: Client,
     imds_base_uri: String,
-    session_token: String,
+    retry_timeout: Duration,
+    session_token: RwLock<String>,
 }
 
 impl ImdsClient {
@@ -45,12 +53,22 @@ impl ImdsClient {
 
     async fn new_impl(imds_base_uri: String) -> Result<Self> {
         let client = Client::new();
-        let session_token = fetch_token(&client, &imds_base_uri).await?;
+        // Retry token timeout tied to wicked.service ifup timeout
+        let retry_timeout = Duration::from_secs(300);
+        let session_token =
+            RwLock::new(fetch_token(&client, &imds_base_uri, &retry_timeout).await?);
         Ok(Self {
             client,
             imds_base_uri,
+            retry_timeout,
             session_token,
         })
+    }
+
+    /// Overrides the default timeout when building your own ImdsClient.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.retry_timeout = timeout;
+        self
     }
 
     /// Gets `user-data` from IMDS. The user-data may be either a UTF-8 string or compressed bytes.
@@ -221,91 +239,93 @@ impl ImdsClient {
             target.as_ref()
         );
         debug!("Requesting {}", &uri);
-        let mut attempt: u8 = 0;
-        let max_attempts: u8 = 3;
-        loop {
-            attempt += 1;
-            ensure!(attempt <= max_attempts, error::FailedFetchIMDS { attempt });
-            if attempt > 1 {
-                time::sleep(Duration::from_secs(1)).await;
-            }
-            let response = self
-                .client
-                .get(&uri)
-                .header("X-aws-ec2-metadata-token", &self.session_token)
-                .send()
-                .await
-                .context(error::Request {
-                    method: "GET",
-                    uri: &uri,
-                })?;
-            trace!("IMDS response: {:?}", &response);
-
-            match response.status() {
-                code @ StatusCode::OK => {
-                    info!("Received {}", target.as_ref());
-                    let response_body = response
-                        .bytes()
-                        .await
-                        .context(error::ResponseBody {
-                            method: "GET",
-                            uri: &uri,
-                            code,
-                        })?
-                        .to_vec();
-
-                    let response_str = printable_string(&response_body);
-                    trace!("Response: {:?}", response_str);
-
-                    return Ok(Some(response_body));
-                }
-
-                // IMDS returns 404 if no user data is given, or if IMDS is disabled
-                StatusCode::NOT_FOUND => return Ok(None),
-
-                // IMDS returns 401 if the session token is expired or invalid
-                StatusCode::UNAUTHORIZED => {
-                    info!("Session token is invalid or expired");
-                    self.refresh_token().await?;
-                    info!("Refreshed session token");
-                    continue;
-                }
-
-                StatusCode::REQUEST_TIMEOUT => {
-                    info!("Retrying request");
-                    continue;
-                }
-
-                code => {
-                    let response_body = response
-                        .bytes()
-                        .await
-                        .context(error::ResponseBody {
-                            method: "GET",
-                            uri: &uri,
-                            code,
-                        })?
-                        .to_vec();
-
-                    let response_str = printable_string(&response_body);
-
-                    trace!("Response: {:?}", response_str);
-
-                    return error::Response {
+        timeout(
+            self.retry_timeout,
+            Retry::spawn(retry_strategy(), || async {
+                let session_token = {
+                    self.session_token
+                        .read()
+                        .map_err(|_| error::Error::FailedReadToken {})?
+                        .clone()
+                };
+                let response = self
+                    .client
+                    .get(&uri)
+                    .header("X-aws-ec2-metadata-token", session_token)
+                    .send()
+                    .await
+                    .context(error::Request {
                         method: "GET",
                         uri: &uri,
-                        code,
-                        response_body: response_str,
+                    })?;
+                trace!("IMDS response: {:?}", &response);
+
+                match response.status() {
+                    code @ StatusCode::OK => {
+                        info!("Received {}", target.as_ref());
+                        let response_body = response
+                            .bytes()
+                            .await
+                            .context(error::ResponseBody {
+                                method: "GET",
+                                uri: &uri,
+                                code,
+                            })?
+                            .to_vec();
+
+                        let response_str = printable_string(&response_body);
+                        trace!("Response: {:?}", response_str);
+
+                        Ok(Some(response_body))
                     }
-                    .fail();
+
+                    // IMDS returns 404 if no user data is given, or if IMDS is disabled
+                    StatusCode::NOT_FOUND => Ok(None),
+
+                    // IMDS returns 401 if the session token is expired or invalid
+                    StatusCode::UNAUTHORIZED => {
+                        warn!("Session token is invalid or expired");
+                        self.refresh_token().await?;
+                        error::UnauthorizedTokenRefreshed.fail()
+                    }
+
+                    code => {
+                        let response_body = response
+                            .bytes()
+                            .await
+                            .context(error::ResponseBody {
+                                method: "GET",
+                                uri: &uri,
+                                code,
+                            })?
+                            .to_vec();
+
+                        let response_str = printable_string(&response_body);
+
+                        trace!("Response: {:?}", response_str);
+
+                        error::Response {
+                            method: "GET".to_string(),
+                            uri: uri.to_string(),
+                            code,
+                            response_body: response_str,
+                        }
+                        .fail()
+                    }
                 }
-            }
-        }
+            }),
+        )
+        .await
+        .context(error::TimeoutFetchIMDS)?
     }
 
     /// Fetches a new session token and adds it to the current ImdsClient.
-    async fn refresh_token(&mut self) -> Result<()> {
-        self.session_token = fetch_token(&self.client, &self.imds_base_uri).await?;
+    async fn refresh_token(&self) -> Result<()> {
+        *self
+            .session_token
+            .write()
+            .map_err(|_| error::Error::FailedWriteToken {})? =
+            fetch_token(&self.client, &self.imds_base_uri, &self.retry_timeout).await?;
         Ok(())
     }
 }
@@ -349,38 +369,36 @@ fn build_public_key_targets(public_key_list: &str) -> Vec<String> {
 }
 
 /// Helper to fetch an IMDSv2 session token that is valid for 60 seconds.
-async fn fetch_token(client: &Client, imds_base_uri: &str) -> Result<String> {
+async fn fetch_token(
+    client: &Client,
+    imds_base_uri: &str,
+    retry_timeout: &Duration,
+) -> Result<String> {
     let uri = format!("{}/{}", imds_base_uri, SESSION_TARGET);
-    let mut attempt: u8 = 0;
-    let max_attempts: u8 = 3;
-    loop {
-        attempt += 1;
-        ensure!(attempt <= max_attempts, error::FailedFetchToken { attempt });
-        if attempt > 1 {
-            time::sleep(Duration::from_secs(5)).await;
-        }
-        let response = client
-            .put(&uri)
-            .header("X-aws-ec2-metadata-token-ttl-seconds", "60")
-            .send()
-            .await
-            .context(error::Request {
-                method: "PUT",
-                uri: &uri,
-            })?;
+    timeout(
+        *retry_timeout,
+        Retry::spawn(retry_strategy(), || async {
+            let response = client
+                .put(&uri)
+                .header("X-aws-ec2-metadata-token-ttl-seconds", "60")
+                .send()
+                .await
+                .context(error::Request {
+                    method: "PUT",
+                    uri: &uri,
+                })?;
 
-        let code = response.status();
-        if code == StatusCode::OK {
+            let code = response.status();
+            ensure!(code == StatusCode::OK, error::FailedFetchToken);
             return response.text().await.context(error::ResponseBody {
                 method: "PUT",
                 uri: &uri,
                 code,
             });
-        } else {
-            info!("Retrying token request");
-            continue;
-        }
-    }
+        }),
+    )
+    .await
+    .context(error::TimeoutFetchToken)?
 }
 
 mod error {
@@ -401,17 +419,24 @@ mod error {
     #[snafu(visibility = "pub(super)")]
 
     pub enum Error {
+        // snafu doesn't yet support the lifetimes used by std::sync::PoisonError
         #[snafu(display("Response '{}' from '{}': {}", get_status_code(source), uri, source))]
         BadResponse { uri: String, source: reqwest::Error },
 
         #[snafu(display("IMDS fetch failed after {} attempts", attempt))]
         FailedFetchIMDS { attempt: u8 },
 
-        #[snafu(display("Failed to fetch IMDSv2 session token after {} attempts", attempt))]
-        FailedFetchToken { attempt: u8 },
+        #[snafu(display("Failed to fetch IMDSv2 session token"))]
+        FailedFetchToken,
+
+        #[snafu(display("Failed to read token within ImdsClient"))]
+        FailedReadToken,
 
         #[snafu(display("IMDS session failed: {}", source))]
         FailedSession { source: reqwest::Error },
+
+        #[snafu(display("Failed to write token to ImdsClient"))]
+        FailedWriteToken,
 
         #[snafu(display("Error retrieving key from {}", target))]
         KeyNotFound { target: String },
@@ -421,6 +446,9 @@ mod error {
 
         #[snafu(display("Response was not UTF-8: {}", source))]
         NonUtf8Response { source: std::string::FromUtf8Error },
+
+        #[snafu(display("IMDSv2 session token was refreshed."))]
+        UnauthorizedTokenRefreshed,
 
         #[snafu(display("Error {}ing '{}': {}", method, uri, source))]
         Request {
@@ -453,6 +481,12 @@ mod error {
 
         #[snafu(display("Deserialization error: {}", source))]
         Serde { source: serde_json::Error },
+
+        #[snafu(display("Timed out fetching data from IMDS: {}", source))]
+        TimeoutFetchIMDS { source: tokio::time::error::Elapsed },
+
+        #[snafu(display("Timed out fetching IMDSv2 session token: {}", source))]
+        TimeoutFetchToken { source: tokio::time::error::Elapsed },
     }
 }
 
@@ -479,7 +513,8 @@ mod test {
                 ),
         );
         let imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
-        assert_eq!(imds_client.session_token, token);
+        let imds_token = { imds_client.session_token.read().unwrap().clone() };
+        assert_eq!(imds_token, token);
     }
 
     #[tokio::test]
@@ -563,9 +598,10 @@ mod test {
         let schema_version = "latest";
         let target = "meta-data/instance-type";
         let response_code = 401;
+        let retry_timeout = Duration::from_secs(2);
         server.expect(
             Expectation::matching(request::method_path("PUT", "/latest/api/token"))
-                .times(4)
+                .times(2..)
                 .respond_with(
                     status_code(200)
                         .append_header("X-aws-ec2-metadata-token-ttl-seconds", "60")
@@ -577,12 +613,15 @@ mod test {
                 "GET",
                 format!("/{}/{}", schema_version, target),
             ))
-            .times(3)
+            .times(2..)
             .respond_with(
                 status_code(response_code).append_header("X-aws-ec2-metadata-token", token),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri)
+            .await
+            .unwrap()
+            .with_timeout(retry_timeout);
         assert!(imds_client
             .fetch_imds(schema_version, target)
             .await
@@ -597,6 +636,7 @@ mod test {
         let schema_version = "latest";
         let target = "meta-data/instance-type";
         let response_code = 408;
+        let retry_timeout = Duration::from_secs(2);
         server.expect(
             Expectation::matching(request::method_path("PUT", "/latest/api/token"))
                 .times(1)
@@ -611,12 +651,15 @@ mod test {
                 "GET",
                 format!("/{}/{}", schema_version, target),
             ))
-            .times(3)
+            .times(2..)
             .respond_with(
                 status_code(response_code).append_header("X-aws-ec2-metadata-token", token),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri)
+            .await
+            .unwrap()
+            .with_timeout(retry_timeout);
         assert!(imds_client
             .fetch_imds(schema_version, target)
             .await
@@ -627,14 +670,17 @@ mod test {
     async fn fetch_token_timeout() {
         let server = Server::run();
         let base_uri = format!("http://{}", server.addr());
+        let retry_timeout = Duration::from_secs(2);
         let response_code = 408;
         server.expect(
             Expectation::matching(request::method_path("PUT", "/latest/api/token"))
-                .times(3)
+                .times(2..)
                 .respond_with(status_code(response_code)),
         );
         let client = Client::new();
-        assert!(fetch_token(&client, &base_uri).await.is_err());
+        assert!(fetch_token(&client, &base_uri, &retry_timeout)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
