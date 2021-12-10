@@ -43,20 +43,19 @@ pub struct ImdsClient {
     client: Client,
     imds_base_uri: String,
     retry_timeout: Duration,
-    session_token: RwLock<String>,
+    session_token: RwLock<Option<String>>,
 }
 
 impl ImdsClient {
-    pub async fn new() -> Result<Self> {
-        Self::new_impl(BASE_URI.to_string()).await
+    pub fn new() -> Result<Self> {
+        Self::new_impl(BASE_URI.to_string())
     }
 
-    async fn new_impl(imds_base_uri: String) -> Result<Self> {
+    fn new_impl(imds_base_uri: String) -> Result<Self> {
         let client = Client::new();
         // Retry token timeout tied to wicked.service ifup timeout
         let retry_timeout = Duration::from_secs(300);
-        let session_token =
-            RwLock::new(fetch_token(&client, &imds_base_uri, &retry_timeout).await?);
+        let session_token = RwLock::new(None);
         Ok(Self {
             client,
             imds_base_uri,
@@ -242,11 +241,12 @@ impl ImdsClient {
         timeout(
             self.retry_timeout,
             Retry::spawn(retry_strategy(), || async {
-                let session_token = {
-                    self.session_token
-                        .read()
-                        .map_err(|_| error::Error::FailedReadToken {})?
-                        .clone()
+                let session_token = match self.read_token().await? {
+                    Some(session_token) => session_token,
+                    None => {
+                        self.write_token().await?;
+                        error::EmptyToken.fail()?
+                    }
                 };
                 let response = self
                     .client
@@ -285,7 +285,7 @@ impl ImdsClient {
                     // IMDS returns 401 if the session token is expired or invalid
                     StatusCode::UNAUTHORIZED => {
                         warn!("Session token is invalid or expired");
-                        self.refresh_token().await?;
+                        self.write_token().await?;
                         error::UnauthorizedTokenRefreshed.fail()
                     }
 
@@ -319,14 +319,28 @@ impl ImdsClient {
         .context(error::TimeoutFetchIMDS)?
     }
 
-    /// Fetches a new session token and adds it to the current ImdsClient.
-    async fn refresh_token(&self) -> Result<()> {
+    /// Fetches a new session token and writes it to the current ImdsClient.
+    async fn write_token(&self) -> Result<()> {
         *self
             .session_token
             .write()
             .map_err(|_| error::Error::FailedWriteToken {})? =
             fetch_token(&self.client, &self.imds_base_uri, &self.retry_timeout).await?;
         Ok(())
+    }
+
+    /// Helper to read session token within the ImdsClient
+    async fn read_token(&self) -> Result<Option<String>> {
+        let session_token = match self
+            .session_token
+            .read()
+            .map_err(|_| error::Error::FailedReadToken {})?
+            .clone()
+        {
+            Some(session_token) => Ok(Some(session_token)),
+            None => Ok(None),
+        };
+        session_token
     }
 }
 
@@ -373,7 +387,7 @@ async fn fetch_token(
     client: &Client,
     imds_base_uri: &str,
     retry_timeout: &Duration,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let uri = format!("{}/{}", imds_base_uri, SESSION_TARGET);
     timeout(
         *retry_timeout,
@@ -390,11 +404,13 @@ async fn fetch_token(
 
             let code = response.status();
             ensure!(code == StatusCode::OK, error::FailedFetchToken);
-            return response.text().await.context(error::ResponseBody {
+
+            let response_body = response.text().await.context(error::ResponseBody {
                 method: "PUT",
                 uri: &uri,
                 code,
-            });
+            })?;
+            Ok(Some(response_body))
         }),
     )
     .await
@@ -422,6 +438,9 @@ mod error {
         // snafu doesn't yet support the lifetimes used by std::sync::PoisonError
         #[snafu(display("Response '{}' from '{}': {}", get_status_code(source), uri, source))]
         BadResponse { uri: String, source: reqwest::Error },
+
+        #[snafu(display("Fetched IMDSv2 session token"))]
+        EmptyToken,
 
         #[snafu(display("IMDS fetch failed after {} attempts", attempt))]
         FailedFetchIMDS { attempt: u8 },
@@ -499,25 +518,6 @@ mod test {
     use httptest::{matchers::*, responders::*, Expectation, Server};
 
     #[tokio::test]
-    async fn new_imds_client() {
-        let server = Server::run();
-        let base_uri = format!("http://{}", server.addr());
-        let token = "some+token";
-        server.expect(
-            Expectation::matching(request::method_path("PUT", "/latest/api/token"))
-                .times(1)
-                .respond_with(
-                    status_code(200)
-                        .append_header("X-aws-ec2-metadata-token-ttl-seconds", "60")
-                        .body(token),
-                ),
-        );
-        let imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
-        let imds_token = { imds_client.session_token.read().unwrap().clone() };
-        assert_eq!(imds_token, token);
-    }
-
-    #[tokio::test]
     async fn fetch_imds() {
         let server = Server::run();
         let base_uri = format!("http://{}", server.addr());
@@ -547,11 +547,13 @@ mod test {
                     .body(response_body),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri).unwrap();
         let imds_data = imds_client
             .fetch_imds(schema_version, target)
             .await
             .unwrap();
+        let imds_token = imds_client.read_token().await.unwrap().unwrap();
+        assert_eq!(imds_token, token);
         assert_eq!(imds_data, Some(response_body.as_bytes().to_vec()));
     }
 
@@ -582,7 +584,7 @@ mod test {
                 status_code(response_code).append_header("X-aws-ec2-metadata-token", token),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri).unwrap();
         let imds_data = imds_client
             .fetch_imds(schema_version, target)
             .await
@@ -619,7 +621,6 @@ mod test {
             ),
         );
         let mut imds_client = ImdsClient::new_impl(base_uri)
-            .await
             .unwrap()
             .with_timeout(retry_timeout);
         assert!(imds_client
@@ -657,7 +658,6 @@ mod test {
             ),
         );
         let mut imds_client = ImdsClient::new_impl(base_uri)
-            .await
             .unwrap()
             .with_timeout(retry_timeout);
         assert!(imds_client
@@ -712,7 +712,7 @@ mod test {
                     .body(response_body),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri).unwrap();
         let imds_data = imds_client.fetch_string(end_target).await.unwrap();
         assert_eq!(imds_data, Some(response_body.to_string()));
     }
@@ -746,7 +746,7 @@ mod test {
                     .body(response_body),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri).unwrap();
         let imds_data = imds_client.fetch_bytes(end_target).await.unwrap();
         assert_eq!(imds_data, Some(response_body.as_bytes().to_vec()));
     }
@@ -779,7 +779,7 @@ mod test {
                     .body(response_body),
             ),
         );
-        let mut imds_client = ImdsClient::new_impl(base_uri).await.unwrap();
+        let mut imds_client = ImdsClient::new_impl(base_uri).unwrap();
         let imds_data = imds_client.fetch_userdata().await.unwrap();
         assert_eq!(imds_data, Some(response_body.as_bytes().to_vec()));
     }
