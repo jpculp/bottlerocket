@@ -1,13 +1,14 @@
 use super::{error, KeyRole, Result};
+use aws_config::meta::region::RegionProviderChain;
 use log::{trace, warn};
 use pubsys_config::SigningKeyConfig;
-use rusoto_core::Region;
 use snafu::{ensure, OptionExt, ResultExt};
 use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
 
 /// The tuftool macro wraps Command to simplify calls to tuftool, adding region functionality.
 macro_rules! tuftool {
@@ -40,6 +41,17 @@ pub fn check_root(root_role_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn async_get_region() -> Result<String> {
+    let default_region_fallback = "us-east-1";
+    let default_region = RegionProviderChain::default_provider()
+        .or_else(default_region_fallback)
+        .region()
+        .await
+        .context(error::DefaultRegionSnafu)?
+        .to_string();
+    Ok(default_region)
+}
+
 /// Creates the directory where root.json will live and creates root.json itself according to details specified in root-role-path
 pub fn create_root(root_role_path: &Path) -> Result<()> {
     // Make /roles and /keys directories, if they don't exist, so we can write generated files.
@@ -48,14 +60,18 @@ pub fn create_root(root_role_path: &Path) -> Result<()> {
         thing: "root role",
     })?;
     fs::create_dir_all(role_dir).context(error::MkdirSnafu { path: role_dir })?;
+
+    let default_region = thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().context(error::RuntimeCreationSnafu)?;
+        runtime.block_on(async_get_region())
+    })
+    .join()
+    .map_err(|_| error::Error::ThreadJoin {})??;
+
     // Initialize root
+    tuftool!(&default_region, "root init '{}'", root_role_path.display());
     tuftool!(
-        Region::default().name(),
-        "root init '{}'",
-        root_role_path.display()
-    );
-    tuftool!(
-        Region::default().name(),
+        &default_region,
         // TODO: expose expiration date as a configurable parameter
         "root expire '{}' 'in 52 weeks'",
         root_role_path.display()
@@ -63,7 +79,7 @@ pub fn create_root(root_role_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Adds keys to root.json according to key type  
+/// Adds keys to root.json according to key type
 pub fn add_keys(
     signing_key_config: &mut SigningKeyConfig,
     role: &KeyRole,
@@ -108,11 +124,16 @@ fn add_keys_kms(
             num_keys: (*available_keys).len(),
         }
     );
-
+    let default_region = thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().context(error::RuntimeCreationSnafu)?;
+        runtime.block_on(async_get_region())
+    })
+    .join()
+    .map_err(|_| error::Error::ThreadJoin {})??;
     match role {
         KeyRole::Root => {
             tuftool!(
-                Region::default().name(),
+                &default_region,
                 "root set-threshold '{}' root '{}' ",
                 filepath,
                 threshold.to_string()
@@ -128,19 +149,19 @@ fn add_keys_kms(
         }
         KeyRole::Publication => {
             tuftool!(
-                Region::default().name(),
+                &default_region,
                 "root set-threshold '{}' snapshot '{}' ",
                 filepath,
                 threshold.to_string()
             );
             tuftool!(
-                Region::default().name(),
+                &default_region,
                 "root set-threshold '{}' targets '{}' ",
                 filepath,
                 threshold.to_string()
             );
             tuftool!(
-                Region::default().name(),
+                &default_region,
                 "root set-threshold '{}' timestamp '{}' ",
                 filepath,
                 threshold.to_string()

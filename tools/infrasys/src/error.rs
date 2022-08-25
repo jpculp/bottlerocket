@@ -1,4 +1,4 @@
-use snafu::Snafu;
+use snafu::{Backtrace, Snafu};
 use std::io;
 use std::path::PathBuf;
 
@@ -14,7 +14,9 @@ pub enum Error {
     CreateStack {
         stack_name: String,
         region: String,
-        source: rusoto_core::RusotoError<rusoto_cloudformation::CreateStackError>,
+        source: aws_sdk_cloudformation::types::SdkError<
+            aws_sdk_cloudformation::error::CreateStackError,
+        >,
     },
 
     #[snafu(display(
@@ -49,7 +51,9 @@ pub enum Error {
     DescribeStack {
         stack_name: String,
         region: String,
-        source: rusoto_core::RusotoError<rusoto_cloudformation::DescribeStacksError>,
+        source: aws_sdk_cloudformation::types::SdkError<
+            aws_sdk_cloudformation::error::DescribeStacksError,
+        >,
     },
 
     #[snafu(display("Missing environment variable '{}'", var))]
@@ -117,11 +121,11 @@ pub enum Error {
         source: std::num::ParseIntError,
     },
 
-    #[snafu(display("Failed to parse '{}' to a valid rusoto region: {}", what, source))]
-    ParseRegion {
-        what: String,
-        source: rusoto_core::region::ParseRegionError,
-    },
+    #[snafu(display("Failed to find default region"))]
+    DefaultRegion,
+
+    #[snafu(display("Unable to parse stack status"))]
+    ParseStatus,
 
     #[snafu(display(
         "Failed to find field '{}' after attempting to create resource '{}'",
@@ -139,7 +143,7 @@ pub enum Error {
     #[snafu(display("Failed to push object to bucket '{}': {}", bucket_name, source))]
     PutObject {
         bucket_name: String,
-        source: rusoto_core::RusotoError<rusoto_s3::PutObjectError>,
+        source: aws_sdk_s3::types::SdkError<aws_sdk_s3::error::PutObjectError>,
     },
 
     #[snafu(display(
@@ -149,17 +153,27 @@ pub enum Error {
     ))]
     PutPolicy {
         bucket_name: String,
-        source: rusoto_core::RusotoError<rusoto_s3::PutBucketPolicyError>,
+        source: aws_sdk_s3::types::SdkError<aws_sdk_s3::error::PutBucketPolicyError>,
     },
 
     #[snafu(display("Failed to create async runtime: {}", source))]
     Runtime { source: std::io::Error },
+
+    /// The library failed to join 'tokio Runtime'.
+    #[snafu(display("Unable to join tokio thread used to offload async workloads"))]
+    ThreadJoin,
 
     #[snafu(display("'tuftool {}' returned {}", command, code))]
     TuftoolResult { command: String, code: String },
 
     #[snafu(display("Failed to start tuftool: {}", source))]
     TuftoolSpawn { source: io::Error },
+
+    #[snafu(display("Unable to create tokio runtime: {}", source))]
+    RuntimeCreation {
+        source: std::io::Error,
+        backtrace: Backtrace,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
