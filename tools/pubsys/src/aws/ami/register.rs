@@ -1,11 +1,9 @@
 use super::{snapshot::snapshot_from_image, AmiArgs};
+use aws_sdk_ebs::Client as EbsClient;
+use aws_sdk_ec2::model::{BlockDeviceMapping, EbsBlockDevice, Filter, VolumeType};
+use aws_sdk_ec2::Client as Ec2Client;
 use coldsnap::{SnapshotUploader, SnapshotWaiter};
 use log::{debug, info, warn};
-use rusoto_ebs::EbsClient;
-use rusoto_ec2::{
-    BlockDeviceMapping, DeleteSnapshotRequest, DescribeImagesRequest, EbsBlockDevice, Ec2,
-    Ec2Client, Filter, RegisterImageRequest,
-};
 use snafu::{ensure, OptionExt, ResultExt};
 
 const ROOT_DEVICE_NAME: &str = "/dev/xvda";
@@ -74,17 +72,17 @@ async fn _register_image(
     }
 
     // Prepare parameters for AMI registration request
-    let root_bdm = BlockDeviceMapping {
-        device_name: Some(ROOT_DEVICE_NAME.to_string()),
-        ebs: Some(EbsBlockDevice {
-            delete_on_termination: Some(true),
-            snapshot_id: Some(root_snapshot.clone()),
-            volume_type: Some(VOLUME_TYPE.to_string()),
-            volume_size: ami_args.root_volume_size,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let root_bdm = BlockDeviceMapping::builder()
+        .set_device_name(Some(ROOT_DEVICE_NAME.to_string()))
+        .set_ebs(Some(
+            EbsBlockDevice::builder()
+                .set_delete_on_termination(Some(true))
+                .set_snapshot_id(Some(root_snapshot.clone()))
+                .set_volume_type(Some(VolumeType::from(VOLUME_TYPE)))
+                .set_volume_size(ami_args.root_volume_size)
+                .build(),
+        ))
+        .build();
 
     let mut data_bdm = None;
     if let Some(ref data_snapshot) = data_snapshot {
@@ -102,21 +100,18 @@ async fn _register_image(
         block_device_mappings.push(data_bdm);
     }
 
-    let register_request = RegisterImageRequest {
-        architecture: Some(ami_args.arch.clone()),
-        block_device_mappings: Some(block_device_mappings),
-        description: ami_args.description.clone(),
-        ena_support: Some(ENA),
-        name: ami_args.name.clone(),
-        root_device_name: Some(ROOT_DEVICE_NAME.to_string()),
-        sriov_net_support: Some(SRIOV.to_string()),
-        virtualization_type: Some(VIRT_TYPE.to_string()),
-        ..Default::default()
-    };
-
     info!("Making register image call in {}", region);
     let register_response = ec2_client
-        .register_image(register_request)
+        .register_image()
+        .set_architecture(Some(ami_args.arch.clone()))
+        .set_block_device_mappings(Some(block_device_mappings))
+        .set_description(ami_args.description.clone())
+        .set_ena_support(Some(ENA))
+        .set_name(Some(ami_args.name.clone()))
+        .set_root_device_name(Some(ROOT_DEVICE_NAME.to_string()))
+        .set_sriov_net_support(Some(SRIOV.to_string()))
+        .set_virtualization_type(Some(VIRT_TYPE.to_string()))
+        .send()
         .await
         .context(error::RegisterImageSnafu { region })?;
 
@@ -156,11 +151,12 @@ pub(crate) async fn register_image(
 
     if register_result.is_err() {
         for snapshot_id in cleanup_snapshot_ids {
-            let delete_request = DeleteSnapshotRequest {
-                snapshot_id: snapshot_id.clone(),
-                ..Default::default()
-            };
-            if let Err(e) = ec2_client.delete_snapshot(delete_request).await {
+            if let Err(e) = ec2_client
+                .delete_snapshot()
+                .set_snapshot_id(Some(snapshot_id.clone()))
+                .send()
+                .await
+            {
                 warn!(
                     "While cleaning up, failed to delete snapshot {}: {}",
                     snapshot_id, e
@@ -182,30 +178,28 @@ where
     S1: Into<String>,
     S2: Into<String>,
 {
-    let describe_request = DescribeImagesRequest {
-        owners: Some(vec!["self".to_string()]),
-        filters: Some(vec![
-            Filter {
-                name: Some("name".to_string()),
-                values: Some(vec![name.into()]),
-            },
-            Filter {
-                name: Some("architecture".to_string()),
-                values: Some(vec![arch.into()]),
-            },
-            Filter {
-                name: Some("image-type".to_string()),
-                values: Some(vec!["machine".to_string()]),
-            },
-            Filter {
-                name: Some("virtualization-type".to_string()),
-                values: Some(vec![VIRT_TYPE.to_string()]),
-            },
-        ]),
-        ..Default::default()
-    };
     let describe_response = ec2_client
-        .describe_images(describe_request)
+        .describe_images()
+        .set_owners(Some(vec!["self".to_string()]))
+        .set_filters(Some(vec![
+            Filter::builder()
+                .set_name(Some("name".to_string()))
+                .set_values(Some(vec![name.into()]))
+                .build(),
+            Filter::builder()
+                .set_name(Some("architecture".to_string()))
+                .set_values(Some(vec![arch.into()]))
+                .build(),
+            Filter::builder()
+                .set_name(Some("image-type".to_string()))
+                .set_values(Some(vec!["machine".to_string()]))
+                .build(),
+            Filter::builder()
+                .set_name(Some("virtualization-type".to_string()))
+                .set_values(Some(vec![VIRT_TYPE.to_string()]))
+                .build(),
+        ]))
+        .send()
         .await
         .context(error::DescribeImagesSnafu { region })?;
     if let Some(mut images) = describe_response.images {
@@ -235,6 +229,8 @@ where
 
 mod error {
     use crate::aws::ami;
+    use aws_sdk_ec2::error::{DescribeImagesError, RegisterImageError};
+    use aws_sdk_ec2::types::SdkError;
     use snafu::Snafu;
     use std::path::PathBuf;
 
@@ -244,7 +240,7 @@ mod error {
         #[snafu(display("Failed to describe images in {}: {}", region, source))]
         DescribeImages {
             region: String,
-            source: rusoto_core::RusotoError<rusoto_ec2::DescribeImagesError>,
+            source: SdkError<DescribeImagesError>,
         },
 
         #[snafu(display("Image response in {} did not include image ID", region))]
@@ -256,7 +252,7 @@ mod error {
         #[snafu(display("Failed to register image in {}: {}", region, source))]
         RegisterImage {
             region: String,
-            source: rusoto_core::RusotoError<rusoto_ec2::RegisterImageError>,
+            source: SdkError<RegisterImageError>,
         },
 
         #[snafu(display("Failed to upload snapshot from {} in {}: {}", path.display(),region, source))]

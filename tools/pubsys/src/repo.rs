@@ -5,6 +5,7 @@ pub(crate) mod refresh_repo;
 pub(crate) mod validate_repo;
 
 use crate::{friendly_version, Args};
+use aws_sdk_kms::{Client as KmsClient, Region};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use log::{debug, info, trace, warn};
@@ -12,15 +13,13 @@ use parse_datetime::parse_datetime;
 use pubsys_config::{
     InfraConfig, KMSKeyConfig, RepoConfig, RepoExpirationPolicy, SigningKeyConfig,
 };
-use rusoto_core::Region;
-use rusoto_kms::KmsClient;
 use semver::Version;
 use snafu::{ensure, OptionExt, ResultExt};
 use std::convert::TryInto;
 use std::fs::{self, File};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::thread;
 use structopt::{clap, StructOpt};
 use tempfile::NamedTempFile;
 use tough::{
@@ -411,9 +410,10 @@ fn get_signing_key_source(signing_key_config: &SigningKeyConfig) -> Result<Box<d
                 let key_id_val = key_id
                     .clone()
                     .context(error::MissingConfigSnafu { missing: "key_id" })?;
-                config
-                    .as_ref()
-                    .map_or(Ok(None), |config_val| get_client(config_val, &key_id_val))?
+                match config.as_ref() {
+                    Some(config_val) => get_client(config_val, &key_id_val)?,
+                    None => None,
+                }
             },
             signing_algorithm: KmsSigningAlgorithm::RsassaPssSha256,
         })),
@@ -425,15 +425,31 @@ fn get_signing_key_source(signing_key_config: &SigningKeyConfig) -> Result<Box<d
     }
 }
 
-/// Helper function that generations KMSClient with region (or None) given config containing available keys
-fn get_client(config: &KMSKeyConfig, key_id: &String) -> Result<Option<KmsClient>> {
-    if let Some(region) = config.available_keys.get(key_id) {
-        Ok(Some(KmsClient::new(
-            Region::from_str(region).context(error::ParseRegionSnafu { what: region })?,
-        )))
+/// Helper function that generates a KmsClient or None given config containing available keys
+fn get_client(kmskey_config: &KMSKeyConfig, key_id: &str) -> Result<Option<KmsClient>> {
+    if let Some(region) = kmskey_config.available_keys.get(key_id) {
+        // We are cloning this so that we can send it across a thread boundary
+        let region = region.to_owned();
+        // We need to spin up a new thread to deal with the async nature of the
+        // AWS SDK Rust
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().context(error::RuntimeCreationSnafu)?;
+            Ok(Some(runtime.block_on(async_get_client(&region))))
+        })
+        .join()
+        .map_err(|_| error::Error::ThreadJoin {})?
     } else {
         Ok(None)
     }
+}
+
+/// Helper function that generates a KmsClient given region
+async fn async_get_client(region: &str) -> KmsClient {
+    let client_config = aws_config::from_env()
+        .region(Region::new(region.to_string()))
+        .load()
+        .await;
+    KmsClient::new(&client_config)
 }
 
 /// Common entrypoint from main()
@@ -620,7 +636,7 @@ pub(crate) fn run(args: &Args, repo_args: &RepoArgs) -> Result<()> {
 
 mod error {
     use chrono::{DateTime, Utc};
-    use snafu::Snafu;
+    use snafu::{Backtrace, Snafu};
     use std::io;
     use std::path::PathBuf;
     use url::Url;
@@ -701,12 +717,6 @@ mod error {
         #[snafu(display("Non-UTF8 path '{}' not supported", path.display()))]
         NonUtf8Path { path: PathBuf },
 
-        #[snafu(display("Failed to parse {} to a valid rusoto region: {}", what, source))]
-        ParseRegion {
-            what: String,
-            source: rusoto_core::region::ParseRegionError,
-        },
-
         #[snafu(display("Invalid URL '{}': {}", input, source))]
         ParseUrl {
             input: String,
@@ -753,6 +763,13 @@ mod error {
             source: tough::error::Error,
         },
 
+        /// The library failed to instantiate 'tokio Runtime'.
+        #[snafu(display("Unable to create tokio runtime: {}", source))]
+        RuntimeCreation {
+            source: std::io::Error,
+            backtrace: Backtrace,
+        },
+
         #[snafu(display("Failed to set targets expiration to {}: {}", expiration, source))]
         SetTargetsExpiration {
             expiration: DateTime<Utc>,
@@ -773,6 +790,10 @@ mod error {
 
         #[snafu(display("Failed to create temporary file: {}", source))]
         TempFile { source: io::Error },
+
+        /// The library failed to join 'tokio Runtime'.
+        #[snafu(display("Unable to join tokio thread used to offload async workloads"))]
+        ThreadJoin,
 
         #[snafu(display("Failed to read update metadata '{}': {}", path.display(), source))]
         UpdateMetadataRead {

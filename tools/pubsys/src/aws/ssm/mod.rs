@@ -5,12 +5,12 @@
 pub(crate) mod ssm;
 pub(crate) mod template;
 
-use crate::aws::{ami::Image, client::build_client, parse_arch, region_from_string};
+use crate::aws::{ami::Image, client::build_client_config, parse_arch};
 use crate::Args;
+use aws_sdk_ec2::model::ArchitectureValues;
+use aws_sdk_ssm::Client as SsmClient;
 use log::{info, trace};
-use pubsys_config::{AwsConfig, InfraConfig};
-use rusoto_core::Region;
-use rusoto_ssm::SsmClient;
+use pubsys_config::InfraConfig;
 use serde::Serialize;
 use snafu::{ensure, OptionExt, ResultExt};
 use std::collections::{HashMap, HashSet};
@@ -30,7 +30,7 @@ pub(crate) struct SsmArgs {
 
     /// The architecture of the machine image
     #[structopt(long, parse(try_from_str = parse_arch))]
-    arch: String,
+    arch: ArchitectureValues,
 
     /// The variant name for the current build
     #[structopt(long)]
@@ -76,17 +76,16 @@ pub(crate) async fn run(args: &Args, ssm_args: &SsmArgs) -> Result<()> {
             missing: "aws.regions"
         }
     );
-    let base_region = region_from_string(&regions[0], &aws).context(error::ParseRegionSnafu)?;
+    let base_region = &regions[0];
 
-    let amis = parse_ami_input(&regions, ssm_args, &aws)?;
+    let arch = ssm_args.arch.as_str().to_owned();
+
+    let amis = parse_ami_input(&regions, ssm_args)?;
 
     let mut ssm_clients = HashMap::with_capacity(amis.len());
     for region in amis.keys() {
-        let ssm_client =
-            build_client::<SsmClient>(region, &base_region, &aws).context(error::ClientSnafu {
-                client_type: "SSM",
-                region: region.name(),
-            })?;
+        let client_config = build_client_config(region, &base_region, &aws).await;
+        let ssm_client = SsmClient::new(&client_config);
         ssm_clients.insert(region.clone(), ssm_client);
     }
 
@@ -95,7 +94,7 @@ pub(crate) async fn run(args: &Args, ssm_args: &SsmArgs) -> Result<()> {
     // Non-image-specific context for building and rendering templates
     let build_context = BuildContext {
         variant: &ssm_args.variant,
-        arch: &ssm_args.arch,
+        arch: &arch,
         image_version: &ssm_args.version,
     };
 
@@ -162,12 +161,12 @@ pub(crate) async fn run(args: &Args, ssm_args: &SsmArgs) -> Result<()> {
 /// The key to a unique SSM parameter
 #[derive(Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SsmKey {
-    pub(crate) region: Region,
+    pub(crate) region: String,
     pub(crate) name: String,
 }
 
 impl SsmKey {
-    pub(crate) fn new(region: Region, name: String) -> Self {
+    pub(crate) fn new(region: String, name: String) -> Self {
         Self { region, name }
     }
 }
@@ -190,11 +189,7 @@ pub(crate) struct BuildContext<'a> {
 type SsmParameters = HashMap<SsmKey, String>;
 
 /// Parse the AMI input file
-fn parse_ami_input(
-    regions: &[String],
-    ssm_args: &SsmArgs,
-    aws: &AwsConfig,
-) -> Result<HashMap<Region, Image>> {
+fn parse_ami_input(regions: &[String], ssm_args: &SsmArgs) -> Result<HashMap<String, Image>> {
     info!("Using AMI data from path: {}", ssm_args.ami_input.display());
     let file = File::open(&ssm_args.ami_input).context(error::FileSnafu {
         op: "open",
@@ -231,15 +226,14 @@ fn parse_ami_input(
 
     // Parse region names, adding endpoints from InfraConfig if specified
     let mut amis = HashMap::with_capacity(regions.len());
-    for name in regions {
+    for region in regions {
         let image = ami_input
-            .remove(name)
+            .remove(region)
             // This could only happen if someone removes the check above...
             .with_context(|| error::UnknownRegionsSnafu {
-                regions: vec![name.clone()],
+                regions: vec![region.clone()],
             })?;
-        let region = region_from_string(name, aws).context(error::ParseRegionSnafu)?;
-        amis.insert(region, image);
+        amis.insert(region.clone(), image);
     }
 
     Ok(amis)
@@ -258,9 +252,7 @@ pub(crate) fn key_difference(wanted: &SsmParameters, current: &SsmParameters) ->
         let new_value = &wanted[key];
         println!(
             "{} - {} - new parameter:\n   new value: {}",
-            key.name,
-            key.region.name(),
-            new_value,
+            key.name, key.region, new_value,
         );
         parameters_to_set.insert(
             SsmKey::new(key.region.clone(), key.name.clone()),
@@ -273,14 +265,11 @@ pub(crate) fn key_difference(wanted: &SsmParameters, current: &SsmParameters) ->
         let new_value = &wanted[key];
 
         if current_value == new_value {
-            println!("{} - {} - no change", key.name, key.region.name());
+            println!("{} - {} - no change", key.name, key.region);
         } else {
             println!(
                 "{} - {} - changing value:\n   old value: {}\n   new value: {}",
-                key.name,
-                key.region.name(),
-                current_value,
-                new_value
+                key.name, key.region, current_value, new_value
             );
             parameters_to_set.insert(
                 SsmKey::new(key.region.clone(), key.name.clone()),
@@ -295,7 +284,6 @@ pub(crate) fn key_difference(wanted: &SsmParameters, current: &SsmParameters) ->
 }
 
 mod error {
-    use crate::aws;
     use crate::aws::ssm::{ssm, template};
     use snafu::Snafu;
     use std::io;
@@ -304,13 +292,6 @@ mod error {
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub(super)))]
     pub(crate) enum Error {
-        #[snafu(display("Error creating {} client in {}: {}", client_type, region, source))]
-        Client {
-            client_type: String,
-            region: String,
-            source: aws::client::Error,
-        },
-
         #[snafu(display("Error reading config: {}", source))]
         Config {
             source: pubsys_config::Error,
@@ -351,10 +332,6 @@ mod error {
 
         #[snafu(display("Cowardly refusing to overwrite parameters without ALLOW_CLOBBER"))]
         NoClobber,
-
-        ParseRegion {
-            source: crate::aws::Error,
-        },
 
         #[snafu(display("Failed to render templates: {}", source))]
         RenderTemplates {

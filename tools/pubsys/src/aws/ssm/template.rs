@@ -4,7 +4,6 @@
 use super::{BuildContext, SsmKey, SsmParameters};
 use crate::aws::ami::Image;
 use log::trace;
-use rusoto_core::Region;
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, ResultExt};
 use std::collections::HashMap;
@@ -73,7 +72,7 @@ pub(crate) fn get_parameters(
 /// Render the given template parameters using the data from the given AMIs
 pub(crate) fn render_parameters(
     template_parameters: TemplateParameters,
-    amis: HashMap<Region, Image>,
+    amis: HashMap<String, Image>,
     ssm_prefix: &str,
     build_context: &BuildContext<'_>,
 ) -> Result<SsmParameters> {
@@ -95,7 +94,7 @@ pub(crate) fn render_parameters(
             image_id: &image.id,
             image_name: &image.name,
             image_version: build_context.image_version,
-            region: region.name(),
+            region: &region,
         };
 
         for tp in &template_parameters.parameters {
