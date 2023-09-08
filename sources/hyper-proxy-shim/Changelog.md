@@ -8,6 +8,11 @@
   - test: Adding missing tests
   - chore: Changes to the build process or auxiliary tools/libraries/documentation
 
+## 0.10.0
+- feat: upgrade rust dependencies
+- style: address clippy lints
+- refactor: remove native-tls support
+
 ## 0.9.0
 - feat: upgrade to tokio 1.0
 - feat: add tokio-openssl support

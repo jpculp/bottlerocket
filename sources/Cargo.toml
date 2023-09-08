@@ -103,8 +103,14 @@ members = [
 
     "constants",
 
-    "shimpei"
+    "shimpei",
+
+    "hyper-proxy-shim",
 ]
 
 [profile.release]
 debug = true
+
+# This replaces hyper-proxy with a shim using updated dependencies
+[patch.crates-io.hyper-proxy]
+path = "hyper-proxy-shim"

@@ -1,6 +1,5 @@
 # hyper-proxy
 
-[![Travis Build Status](https://travis-ci.org/tafia/hyper-proxy.svg?branch=master)](https://travis-ci.org/tafia/hyper-proxy)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![crates.io](http://meritbadge.herokuapp.com/hyper-proxy)](https://crates.io/crates/hyper-proxy)
 
@@ -63,10 +62,8 @@ connect to a proxy. It can also be configured without TLS support, by compiling 
 features entirely. The supported list of configurations is:
 
 1. No TLS support (`default-features = false`)
-2. TLS support via `native-tls` to link against the operating system's native TLS implementation
-   (default)
-3. TLS support via `rustls` (`default-features = false, features = ["rustls"]`)
-4. TLS support via `rustls`, using a statically-compiled set of CA certificates to bypass the
+2. TLS support via `rustls` (default)
+3. TLS support via `rustls`, using a statically-compiled set of CA certificates to bypass the
    operating system's default store (`default-features = false, features = ["rustls-webpki"]`)
 
 ## Credits
@@ -75,6 +72,7 @@ Large part of the code comes from [reqwest][2].
 The core part as just been extracted and slightly enhanced.
 
  Main changes are:
+
 - support for authentication
 - add non secured tunneling
 - add the possibility to add additional headers when connecting to the proxy
