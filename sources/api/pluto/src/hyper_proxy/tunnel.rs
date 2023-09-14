@@ -1,4 +1,8 @@
-use crate::io_err;
+// Original Copyright 2017 Johann Tuffe. Licensed under the MIT License.
+// Modifications Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+use crate::hyper_proxy::io_err;
+
 use bytes::{buf::Buf, BytesMut};
 use http::HeaderMap;
 use std::fmt::{self, Display, Formatter};
@@ -141,7 +145,7 @@ mod tests {
         super::new(&host, port, &HeaderMap::new()).with_stream(conn)
     }
 
-    #[cfg_attr(rustfmt, rustfmt_skip)]
+    #[rustfmt::skip]
     macro_rules! mock_tunnel {
         () => {{
             mock_tunnel!(
