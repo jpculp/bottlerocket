@@ -88,7 +88,6 @@ Source1400: logdog.common.conf
 
 Requires: %{_cross_os}acpid
 Requires: %{_cross_os}audit
-Requires: %{_cross_os}ca-certificates
 Requires: %{_cross_os}chrony
 Requires: %{_cross_os}conntrack-tools
 Requires: %{_cross_os}containerd
