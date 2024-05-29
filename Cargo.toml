@@ -7,7 +7,6 @@ members = [
     "packages/aws-signing-helper",
     "packages/bash",
     "packages/binutils",
-    "packages/ca-certificates",
     "packages/chrony",
     "packages/cni",
     "packages/cni-plugins",
